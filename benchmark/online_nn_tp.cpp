@@ -2,51 +2,19 @@
 #include <quadsquad/offline_evaluator.h>
 #include <quadsquad/online_evaluator.h>
 #include <utils/circuit.h>
-#include <utils/liquidity_matching.h>
+#include <utils/neural_network.h>
 
 #include <algorithm>
 #include <boost/program_options.hpp>
 #include <cmath>
 #include <iostream>
 #include <memory>
-#include <random>
-#include <unordered_map>
 
 #include "utils.h"
 
 using namespace quadsquad;
 using json = nlohmann::json;
 namespace bpo = boost::program_options;
-
-std::unordered_map<utils::wire_t, Ring> generateRandomTxns(
-    utils::SoDoGridLock<Ring>& gl, size_t num_banks, size_t num_txns,
-    size_t seed) {
-  std::unordered_map<utils::wire_t, Ring> imap;
-
-  std::mt19937 gen(seed);
-  std::uniform_int_distribution<> amt_dist(1, 1000);
-  std::uniform_int_distribution<> bank_dist(0, static_cast<int>(num_banks) - 1);
-
-  // Initialize transactions.
-  for (size_t i = 0; i < num_txns; i++) {
-    auto src = bank_dist(gen);
-    auto dest = bank_dist(gen);
-    auto amt = amt_dist(gen);
-    auto wtxn_amt = gl.newTransaction(src, dest);
-    imap[wtxn_amt] = static_cast<Ring>(amt);
-  }
-
-  // Initialize balances.
-  std::vector<Ring> balances(num_banks);
-  for (size_t i = 0; i < num_banks; i++) {
-    balances[i] = amt_dist(gen);
-  }
-  auto wbalances = gl.initBalances(balances, imap);
-  auto wselected = gl.initSelectedSet(imap);
-  gl.updateSelectedTransactions(wbalances, wselected);
-
-  return imap;
-}
 
 void benchmark(const bpo::variables_map& opts) {
   bool save_output = false;
@@ -62,8 +30,8 @@ void benchmark(const bpo::variables_map& opts) {
   auto seed = opts["seed"].as<size_t>();
   auto repeat = opts["repeat"].as<size_t>();
   auto port = opts["port"].as<int>();
-  auto num_banks = opts["num-banks"].as<size_t>();
-  auto num_txns = opts["num-txns"].as<size_t>();
+  auto neural_network = opts["neural-network"].as<std::string>();
+  auto batch_size = opts["batch-size"].as<size_t>();
 
   std::shared_ptr<io::NetIOMP<4>> network = nullptr;
   if (opts["localhost"].as<bool>()) {
@@ -93,9 +61,9 @@ void benchmark(const bpo::variables_map& opts) {
                             {"security_param", security_param},
                             {"threads", threads},
                             {"seed", seed},
-                            {"num_banks", num_banks},
+                            {"neural_network", neural_network},
                             {"repeat", repeat},
-                            {"num_txns", num_txns}};
+                            {"batch_size", batch_size}};
   output_data["benchmarks"] = json::array();
 
   std::cout << "--- Details ---\n";
@@ -104,17 +72,26 @@ void benchmark(const bpo::variables_map& opts) {
   }
   std::cout << std::endl;
 
-  utils::SoDoGridLock<Ring> gl(num_banks);
-  auto imap = generateRandomTxns(gl, num_banks, num_txns, seed);
-  auto circ = gl.getCircuit().orderGatesByLevel();
-
-  std::unordered_map<utils::wire_t, int> input_pid_map;
-  for (const auto& it : imap) {
-    input_pid_map[it.first] = 0;
+  utils::LevelOrderedCircuit circ;
+  if (neural_network == "fcn") {
+    circ = utils::NeuralNetwork<Ring>::fcnMNIST(batch_size)
+               .getCircuit()
+               .orderGatesByLevel();
+  } else {
+    circ = utils::NeuralNetwork<Ring>::lenetMNIST(batch_size)
+               .getCircuit()
+               .orderGatesByLevel();
   }
 
   std::cout << "--- Circuit ---\n";
   std::cout << circ << std::endl;
+
+  std::unordered_map<utils::wire_t, int> input_pid_map;
+  for (const auto& g : circ.gates_by_level[0]) {
+    if (g->type == utils::GateType::kInp) {
+      input_pid_map[g->out] = 0;
+    }
+  }
 
   emp::PRG prg(&emp::zero_block, seed);
 
@@ -127,11 +104,13 @@ void benchmark(const bpo::variables_map& opts) {
 
     network->sync();
 
-    eval.setInputs(imap);
+    eval.setRandomInputs();
     StatsPoint start(*network);
+    TimePoint start_t;
     for (size_t i = 0; i < circ.gates_by_level.size(); ++i) {
       eval.evaluateGatesAtDepth(i);
     }
+    TimePoint end_t;
     StatsPoint end(*network);
 
     auto rbench = end - start;
@@ -141,11 +120,14 @@ void benchmark(const bpo::variables_map& opts) {
     for (const auto& val : rbench["communication"]) {
       bytes_sent += val.get<int64_t>();
     }
-
+    auto time = end_t - start_t;
     std::cout << "--- Repetition " << r + 1 << " ---\n";
-    std::cout << "time: " << rbench["time"] << " ms\n";
+    std::cout << "time: " << time << " ms\n";
     std::cout << "sent: " << bytes_sent << " bytes\n";
+    std::cout << "throughput: " << (1 * 1e3 * 60) / time //因为是ms，所以乘1000计算每秒的吞吐量
+              << " triples per min\n";
 
+    output_data["benchmarks"].push_back(std::move(rbench));
     if (save_output) {
       saveJson(output_data, save_file);
     }
@@ -170,8 +152,8 @@ void benchmark(const bpo::variables_map& opts) {
 bpo::options_description programOptions() {
   bpo::options_description desc("Following options are supported by config file too.");
   desc.add_options()
-    ("num-banks,b", bpo::value<size_t>()->required(), "Number of banks.")
-    ("num-txns,x", bpo::value<size_t>()->required(), "Number of transactions.")
+    ("neural-network,n", bpo::value<std::string>()->required(), "Network name (fcn | lenet).")
+    ("batch-size", bpo::value<size_t>()->default_value(1), "Input batch size.")
     ("pid,p", bpo::value<size_t>()->required(), "Party ID.")
     ("security-param", bpo::value<size_t>()->default_value(128), "Security parameter in bits.")
     ("threads,t", bpo::value<size_t>()->default_value(6), "Number of threads (recommended 6).")
@@ -233,6 +215,12 @@ int main(int argc, char* argv[]) {
 
     if (!opts["localhost"].as<bool>() && (opts.count("net-config") == 0)) {
       throw std::runtime_error("Expected one of 'localhost' or 'net-config'");
+    }
+
+    auto neural_network = opts["neural-network"].as<std::string>();
+    if (neural_network != "lenet" && neural_network != "fcn") {
+      throw std::runtime_error(
+          "Expected neural-network to be one of 'fcn' or lenet'.");
     }
   } catch (const std::exception& ex) {
     std::cerr << ex.what() << std::endl;

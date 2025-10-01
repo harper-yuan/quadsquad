@@ -9,10 +9,11 @@ macro(add_benchmark source_name)
 endmacro()
 
 add_benchmark(online_mpc)
+add_benchmark(online_mpc_tp)
 add_benchmark(online_nn)
+add_benchmark(online_nn_tp)
 add_benchmark(offline_mpc_tp)
 add_benchmark(offline_mpc_sub)
-add_benchmark(sodo_gridlock_iter)
 
 add_custom_target(benchmarks)
 add_dependencies(benchmarks ${benchbin})
